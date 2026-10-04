@@ -1,0 +1,5 @@
+PySide6>=6.8,<7
+PyWinCtl>=0.4,<1
+psutil>=5.9,<8
+watchdog>=4,<7
+pyinstaller>=6,<7
