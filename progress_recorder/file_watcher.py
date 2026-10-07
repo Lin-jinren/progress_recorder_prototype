@@ -75,6 +75,8 @@ class FileWatcher:
             if now - last < 3:
                 return
             self._recent[key] = now
+            if len(self._recent) > 1000:
+                self._recent = {k: t for k, t in self._recent.items() if now - t < 3}
 
         self.db.add_event(
             "file",

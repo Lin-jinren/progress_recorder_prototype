@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 
 @dataclass
 class Event:
     id: int
-    event_type: str
+    event_type: str  # "window" | "file" | "note" | "idle"
     started_at: float
     ended_at: float
     app_name: str
@@ -24,6 +25,13 @@ class Event:
         return max(0.0, self.ended_at - self.started_at)
 
 
+def day_bounds(target: date) -> tuple[float, float]:
+    """Local-time [start, end) timestamps of a day. Naive datetimes follow DST correctly."""
+    start = datetime.combine(target, dt_time.min).timestamp()
+    end = datetime.combine(target + timedelta(days=1), dt_time.min).timestamp()
+    return start, end
+
+
 class Database:
     """Very small SQLite wrapper; intentionally no ORM to keep it easy to edit."""
 
@@ -32,11 +40,18 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # sqlite3's own `with conn:` only commits; it never closes the connection,
+        # which leaves the DB file locked on Windows. Always close here.
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -83,25 +98,25 @@ class Database:
             return int(cur.lastrowid)
 
     def extend_event(self, event_id: int, ended_at: Optional[float] = None) -> None:
+        """Set an event's end time. Never moves the end before the start."""
         end = time.time() if ended_at is None else ended_at
         with self._connect() as conn:
             conn.execute(
-                "UPDATE events SET ended_at = ? WHERE id = ?",
+                "UPDATE events SET ended_at = MAX(started_at, ?) WHERE id = ?",
                 (end, event_id),
             )
 
     def events_for_day(self, target: date) -> list[Event]:
-        local_tz = datetime.now().astimezone().tzinfo
-        start = datetime.combine(target, dt_time.min, tzinfo=local_tz).timestamp()
-        end = datetime.combine(target, dt_time.max, tzinfo=local_tz).timestamp()
+        """All events overlapping the day, including sessions that cross midnight."""
+        start, end = day_bounds(target)
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM events
-                WHERE started_at BETWEEN ? AND ?
+                WHERE started_at < ? AND ended_at >= ?
                 ORDER BY started_at ASC
                 """,
-                (start, end),
+                (end, start),
             ).fetchall()
         return [Event(**dict(row)) for row in rows]
 

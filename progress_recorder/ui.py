@@ -1,33 +1,31 @@
 from __future__ import annotations
 
-import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt, QUrl
+from PySide6.QtCore import QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPushButton,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from .config import DB_PATH, EXPORT_DIR, load_config, save_config
+from .classifier import CATEGORY_LABELS, Classifier
+from .config import DB_PATH, load_config
 from .database import Database
+from .dialogs import FoldersDialog, RulesDialog
 from .file_watcher import FileWatcher
-from .reporter import build_ai_prompt, build_daily_stats, make_markdown
+from .reporter import human_duration
+from .review import ReviewDialog
 from .tracker import ActivityTracker
 
 
@@ -39,7 +37,12 @@ class MainWindow(QMainWindow):
 
         self.config = load_config()
         self.db = Database(DB_PATH)
-        self.tracker = ActivityTracker(self.db)
+        self.classifier = Classifier(self.config.classification_rules)
+        self.tracker = ActivityTracker(
+            self.db,
+            idle_threshold=self.config.idle_threshold_seconds,
+            poll_seconds=self.config.poll_seconds,
+        )
         self.file_watcher = FileWatcher(self.db, self.config.watched_extensions)
         self.recording = False
 
@@ -60,7 +63,10 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 20px; font-weight: 600;")
         layout.addWidget(title)
 
-        privacy = QLabel("只記錄前景程式/視窗標題、你指定資料夾的檔案變更，以及你手動輸入的備註；不截圖、不記鍵盤內容。")
+        privacy = QLabel(
+            "只記錄前景程式/視窗標題、你指定資料夾的檔案變更，以及你手動輸入的備註；不截圖、不記鍵盤內容。"
+            "閒置偵測只讀取「最後一次操作的時間」。"
+        )
         privacy.setWordWrap(True)
         layout.addWidget(privacy)
 
@@ -69,21 +75,15 @@ class MainWindow(QMainWindow):
         self.record_button.clicked.connect(self._toggle_recording)
         controls.addWidget(self.record_button)
 
-        add_folder_button = QPushButton("加入監控資料夾")
-        add_folder_button.clicked.connect(self._add_watch_folder)
-        controls.addWidget(add_folder_button)
-
-        report_button = QPushButton("產生今日進度")
-        report_button.clicked.connect(self._generate_report)
-        controls.addWidget(report_button)
-
-        ai_prompt_button = QPushButton("複製 AI 整理 Prompt")
-        ai_prompt_button.clicked.connect(self._copy_ai_prompt)
-        controls.addWidget(ai_prompt_button)
-
-        open_data_button = QPushButton("開啟資料目錄")
-        open_data_button.clicked.connect(self._open_data_dir)
-        controls.addWidget(open_data_button)
+        for label, handler in (
+            ("審閱 / 產生報告", self._open_review),
+            ("監控資料夾", self._open_folders),
+            ("分類規則", self._open_rules),
+            ("開啟資料目錄", self._open_data_dir),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(handler)
+            controls.addWidget(button)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -103,29 +103,24 @@ class MainWindow(QMainWindow):
         note_row.addWidget(note_button)
         layout.addLayout(note_row)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        layout.addWidget(splitter, stretch=1)
-
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["時間", "類型", "程式/檔案", "內容"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["時間", "類型", "分類", "程式/檔案", "內容"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        splitter.addWidget(self.table)
+        layout.addWidget(self.table, stretch=1)
 
-        self.report_preview = QTextEdit()
-        self.report_preview.setPlaceholderText("按「產生今日進度」後，Markdown 會出現在這裡。")
-        splitter.addWidget(self.report_preview)
-        splitter.setSizes([380, 260])
+    # ----- recording ----------------------------------------------------------
 
     def _toggle_recording(self) -> None:
         if self.recording:
             self._stop_recording()
+            self._open_review()
         else:
             self._start_recording()
 
     def _start_recording(self) -> None:
         self.recording = True
-        self.record_button.setText("停止記錄")
+        self.record_button.setText("結束工作")
         self.timer.start()
         self.file_watcher.start(self.config.watched_folders)
         self._sample_activity()
@@ -144,6 +139,8 @@ class MainWindow(QMainWindow):
         state = self.tracker.sample()
         if state == "unavailable":
             self.status_label.setText(f"狀態：記錄中；{self.tracker.last_error}")
+        elif state == "idle":
+            self.status_label.setText("狀態：閒置中（不計入工作時間）")
         else:
             self.status_label.setText("狀態：記錄中")
         self._refresh_table()
@@ -156,17 +153,31 @@ class MainWindow(QMainWindow):
         self.note_input.clear()
         self._refresh_table()
 
-    def _add_watch_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "選擇要監控的工作資料夾")
-        if not folder:
-            return
-        normalized = str(Path(folder).resolve())
-        if normalized not in self.config.watched_folders:
-            self.config.watched_folders.append(normalized)
-            save_config(self.config)
+    # ----- dialogs ------------------------------------------------------------
+
+    def _open_review(self) -> None:
+        ReviewDialog(self.db, self.config, date.today(), self).exec()
+        self._rules_changed()
+
+    def _open_folders(self) -> None:
+        FoldersDialog(self.config, self).exec()
         if self.recording:
             self.file_watcher.start(self.config.watched_folders)
         self._update_watch_label()
+
+    def _open_rules(self) -> None:
+        RulesDialog(self.config, self).exec()
+        self._rules_changed()
+
+    def _rules_changed(self) -> None:
+        self.classifier = Classifier(self.config.classification_rules)
+        self._refresh_table()
+
+    def _open_data_dir(self) -> None:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(DB_PATH.parent)))
+
+    # ----- display ------------------------------------------------------------
 
     def _update_watch_label(self) -> None:
         if self.config.watched_folders:
@@ -186,32 +197,16 @@ class MainWindow(QMainWindow):
             elif event.event_type == "file":
                 subject = Path(event.file_path).name
                 detail = event.detail
+            elif event.event_type == "idle":
+                subject = "閒置"
+                detail = human_duration(event.duration_seconds)
             else:
                 subject = "手動備註"
                 detail = event.detail
-            for col, value in enumerate([clock, event.event_type, subject, detail]):
+            category = CATEGORY_LABELS.get(self.classifier.classify(event), "")
+            for col, value in enumerate([clock, event.event_type, category, subject, detail]):
                 self.table.setItem(row, col, QTableWidgetItem(str(value)))
         self.table.resizeColumnsToContents()
-
-    def _generate_report(self) -> None:
-        stats = build_daily_stats(self.db, date.today())
-        markdown = make_markdown(stats)
-        self.report_preview.setPlainText(markdown)
-
-        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-        out = EXPORT_DIR / f"progress-{date.today().isoformat()}.md"
-        out.write_text(markdown, encoding="utf-8")
-        self.status_label.setText(f"已輸出：{out}")
-
-    def _copy_ai_prompt(self) -> None:
-        stats = build_daily_stats(self.db, date.today())
-        prompt = build_ai_prompt(stats)
-        QApplication.clipboard().setText(prompt)
-        self.status_label.setText("AI Prompt 已複製到剪貼簿")
-
-    def _open_data_dir(self) -> None:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(DB_PATH.parent)))
 
     def closeEvent(self, event) -> None:
         self.timer.stop()
